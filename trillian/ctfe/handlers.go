@@ -47,7 +47,8 @@ import (
 )
 
 var (
-	alignGetEntries = flag.Bool("align_getentries", true, "Enable get-entries request alignment")
+	alignGetEntries   = flag.Bool("align_getentries", true, "Enable get-entries request alignment")
+	getEntriesMetrics = flag.Bool("getentries_metrics", false, "Export get-entries distribution metrics")
 )
 
 const (
@@ -106,19 +107,20 @@ const (
 var (
 	// Metrics are all per-log (label "logid"), but may also be
 	// per-entrypoint (label "ep") or per-return-code (label "rc").
-	once               sync.Once
-	knownLogs          monitoring.Gauge     // logid => value (always 1.0)
-	isMirrorLog        monitoring.Gauge     // logid => value (either 0.0 or 1.0)
-	maxMergeDelay      monitoring.Gauge     // logid => value
-	expMergeDelay      monitoring.Gauge     // logid => value
-	lastSCTTimestamp   monitoring.Gauge     // logid => value
-	lastSTHTimestamp   monitoring.Gauge     // logid => value
-	lastSTHTreeSize    monitoring.Gauge     // logid => value
-	frozenSTHTimestamp monitoring.Gauge     // logid => value
-	reqsCounter        monitoring.Counter   // logid, ep => value
-	rspsCounter        monitoring.Counter   // logid, ep, rc => value
-	rspLatency         monitoring.Histogram // logid, ep, rc => value
-	alignedGetEntries  monitoring.Counter   // logid, aligned => count
+	once                       sync.Once
+	knownLogs                  monitoring.Gauge     // logid => value (always 1.0)
+	isMirrorLog                monitoring.Gauge     // logid => value (either 0.0 or 1.0)
+	maxMergeDelay              monitoring.Gauge     // logid => value
+	expMergeDelay              monitoring.Gauge     // logid => value
+	lastSCTTimestamp           monitoring.Gauge     // logid => value
+	lastSTHTimestamp           monitoring.Gauge     // logid => value
+	lastSTHTreeSize            monitoring.Gauge     // logid => value
+	frozenSTHTimestamp         monitoring.Gauge     // logid => value
+	reqsCounter                monitoring.Counter   // logid, ep => value
+	rspsCounter                monitoring.Counter   // logid, ep, rc => value
+	rspLatency                 monitoring.Histogram // logid, ep, rc => value
+	alignedGetEntries          monitoring.Counter   // logid, aligned => count
+	getEntriesStartPercentiles monitoring.Histogram // logid => percentile
 )
 
 // setupMetrics initializes all the exported metrics.
@@ -135,6 +137,12 @@ func setupMetrics(mf monitoring.MetricFactory) {
 	rspsCounter = mf.NewCounter("http_rsps", "Number of responses", "logid", "ep", "rc")
 	rspLatency = mf.NewHistogram("http_latency", "Latency of responses in seconds", "logid", "ep", "rc")
 	alignedGetEntries = mf.NewCounter("aligned_get_entries", "Number of get-entries requests which were aligned to size limit boundaries", "logid", "aligned")
+	getEntriesStartPercentiles = mf.NewHistogramWithBuckets(
+		"get_leaves_start_percentiles",
+		"Start index of GetLeavesByRange request using percentage of current log size at the time",
+		monitoring.PercentileBuckets(5),
+		"logid",
+	)
 }
 
 // Entrypoints is a list of entrypoint names as exposed in statistics/logging.
@@ -248,6 +256,11 @@ func NewCertValidationOpts(trustedRoots *x509util.PEMCertPool, currentTime time.
 	return vOpts
 }
 
+type leafChainBuilder interface {
+	BuildLogLeaf(ctx context.Context, chain []*x509.Certificate, logPrefix string, merkleLeaf *ct.MerkleTreeLeaf, isPrecert bool) (*trillian.LogLeaf, error)
+	FixLogLeaf(ctx context.Context, leaf *trillian.LogLeaf) error
+}
+
 // logInfo holds information for a specific log instance.
 type logInfo struct {
 	// LogPrefix is a pre-formatted string identifying the log for diagnostics
@@ -270,6 +283,8 @@ type logInfo struct {
 	signer crypto.Signer
 	// sthGetter provides STHs for the log
 	sthGetter STHGetter
+	// issuanceChainService provides the issuance chain add and get operations
+	issuanceChainService leafChainBuilder
 }
 
 // newLogInfo creates a new instance of logInfo.
@@ -278,6 +293,7 @@ func newLogInfo(
 	validationOpts CertValidationOpts,
 	signer crypto.Signer,
 	timeSource util.TimeSource,
+	issuanceChainService leafChainBuilder,
 ) *logInfo {
 	vCfg := instanceOpts.Validated
 	cfg := vCfg.Config
@@ -321,6 +337,8 @@ func newLogInfo(
 	}
 	maxMergeDelay.Set(float64(cfg.MaxMergeDelaySec), label)
 	expMergeDelay.Set(float64(cfg.ExpectedMergeDelaySec), label)
+
+	li.issuanceChainService = issuanceChainService
 
 	return li
 }
@@ -373,6 +391,10 @@ func (li *logInfo) getSTH(ctx context.Context) (*ct.SignedTreeHead, error) {
 	lastSTHTimestamp.Set(float64(sth.Timestamp), logID)
 	lastSTHTreeSize.Set(float64(sth.TreeSize), logID)
 	return sth, nil
+}
+
+func (li *logInfo) buildLeaf(ctx context.Context, chain []*x509.Certificate, merkleLeaf *ct.MerkleTreeLeaf, isPrecert bool) (*trillian.LogLeaf, error) {
+	return li.issuanceChainService.BuildLogLeaf(ctx, chain, li.LogPrefix, merkleLeaf, isPrecert)
 }
 
 // ParseBodyAsJSONChain tries to extract cert-chain out of request.
@@ -448,6 +470,11 @@ func addChainInternal(ctx context.Context, li *logInfo, w http.ResponseWriter, r
 	for _, cert := range chain {
 		li.RequestLog.AddCertToChain(ctx, cert)
 	}
+
+	if rateLimitNonFreshSubmission(li, chain[0]) {
+		return http.StatusTooManyRequests, fmt.Errorf("rate-limited submission considered to be non-fresh")
+	}
+
 	// Get the current time in the form used throughout RFC6962, namely milliseconds since Unix
 	// epoch, and use this throughout.
 	timeMillis := uint64(li.TimeSource.Now().UnixNano() / millisPerNano)
@@ -457,15 +484,15 @@ func addChainInternal(ctx context.Context, li *logInfo, w http.ResponseWriter, r
 	if err != nil {
 		return http.StatusBadRequest, fmt.Errorf("failed to build MerkleTreeLeaf: %s", err)
 	}
-	leaf, err := buildLogLeafForAddChain(li, *merkleLeaf, chain, isPrecert)
+	leaf, err := li.buildLeaf(ctx, chain, merkleLeaf, isPrecert)
 	if err != nil {
-		return http.StatusInternalServerError, fmt.Errorf("failed to build LogLeaf: %s", err)
+		return http.StatusInternalServerError, err
 	}
 
 	// Send the Merkle tree leaf on to the Log server.
 	req := trillian.QueueLeafRequest{
 		LogId:    li.logID,
-		Leaf:     &leaf,
+		Leaf:     leaf,
 		ChargeTo: li.chargeUser(r),
 	}
 	if li.instanceOpts.CertificateQuotaUser != nil {
@@ -737,10 +764,11 @@ func getEntries(ctx context.Context, li *logInfo, w http.ResponseWriter, r *http
 		Count:      count,
 		ChargeTo:   li.chargeUser(r),
 	}
-	rsp, err := li.rpcClient.GetLeavesByRange(ctx, &req)
+	rsp, httpStatus, err := rpcGetLeavesByRange(ctx, li, &req)
 	if err != nil {
-		return li.toHTTPStatus(err), fmt.Errorf("backend GetLeavesByRange request failed: %s", err)
+		return httpStatus, err
 	}
+
 	var currentRoot types.LogRootV1
 	if err := currentRoot.UnmarshalBinary(rsp.GetSignedLogRoot().GetLogRoot()); err != nil {
 		return http.StatusInternalServerError, fmt.Errorf("failed to unmarshal root: %v", rsp.GetSignedLogRoot().GetLogRoot())
@@ -749,6 +777,10 @@ func getEntries(ctx context.Context, li *logInfo, w http.ResponseWriter, r *http
 		// If the returned tree is too small to contain any leaves return the 4xx
 		// explicitly here.
 		return http.StatusBadRequest, fmt.Errorf("need tree size: %d to get leaves but only got: %d", start+1, currentRoot.TreeSize)
+	}
+	if *getEntriesMetrics {
+		label := strconv.FormatInt(req.LogId, 10)
+		recordStartPercent(start, currentRoot.TreeSize, label)
 	}
 	// Do some sanity checks on the result.
 	if len(rsp.Leaves) > int(count) {
@@ -784,6 +816,21 @@ func getEntries(ctx context.Context, li *logInfo, w http.ResponseWriter, r *http
 	}
 
 	return http.StatusOK, nil
+}
+
+// rpcGetLeavesByRange calls Trillian GetLeavesByRange RPC and fixes issuance chain in each log leaf if necessary.
+func rpcGetLeavesByRange(ctx context.Context, li *logInfo, req *trillian.GetLeavesByRangeRequest) (*trillian.GetLeavesByRangeResponse, int, error) {
+	rsp, err := li.rpcClient.GetLeavesByRange(ctx, req)
+	if err != nil {
+		return nil, li.toHTTPStatus(err), fmt.Errorf("backend GetLeavesByRange request failed: %s", err)
+	}
+	for _, leaf := range rsp.Leaves {
+		if err := li.issuanceChainService.FixLogLeaf(ctx, leaf); err != nil {
+			return nil, http.StatusInternalServerError, fmt.Errorf("failed to fix log leaf: %v", rsp)
+		}
+	}
+
+	return rsp, http.StatusOK, nil
 }
 
 func getRoots(_ context.Context, li *logInfo, w http.ResponseWriter, _ *http.Request) (int, error) {
@@ -822,9 +869,9 @@ func getEntryAndProof(ctx context.Context, li *logInfo, w http.ResponseWriter, r
 		TreeSize:  treeSize,
 		ChargeTo:  li.chargeUser(r),
 	}
-	rsp, err := li.rpcClient.GetEntryAndProof(ctx, &req)
+	rsp, httpStatus, err := rpcGetEntryAndProof(ctx, li, &req)
 	if err != nil {
-		return li.toHTTPStatus(err), fmt.Errorf("backend GetEntryAndProof request failed: %s", err)
+		return httpStatus, err
 	}
 
 	var currentRoot types.LogRootV1
@@ -869,6 +916,19 @@ func getEntryAndProof(ctx context.Context, li *logInfo, w http.ResponseWriter, r
 	return http.StatusOK, nil
 }
 
+// rpcGetEntryAndProof calls Trillian GetEntryAndProof RPC and fixes issuance chain in the log leaf if necessary.
+func rpcGetEntryAndProof(ctx context.Context, li *logInfo, req *trillian.GetEntryAndProofRequest) (*trillian.GetEntryAndProofResponse, int, error) {
+	rsp, err := li.rpcClient.GetEntryAndProof(ctx, req)
+	if err != nil {
+		return nil, li.toHTTPStatus(err), fmt.Errorf("backend GetEntryAndProof request failed: %s", err)
+	}
+	if err := li.issuanceChainService.FixLogLeaf(ctx, rsp.Leaf); err != nil {
+		return nil, http.StatusInternalServerError, fmt.Errorf("failed to fix log leaf: %v", rsp)
+	}
+
+	return rsp, http.StatusOK, nil
+}
+
 // getRPCDeadlineTime calculates the future time an RPC should expire based on our config
 func getRPCDeadlineTime(li *logInfo) time.Time {
 	return li.TimeSource.Now().Add(li.instanceOpts.Deadline)
@@ -903,21 +963,14 @@ func verifyAddChain(li *logInfo, req ct.AddChainRequest, expectingPrecert bool) 
 	return validPath, nil
 }
 
-func extractRawCerts(chain []*x509.Certificate) []ct.ASN1Cert {
-	raw := make([]ct.ASN1Cert, len(chain))
-	for i, cert := range chain {
-		raw[i] = ct.ASN1Cert{Data: cert.Raw}
+func rateLimitNonFreshSubmission(li *logInfo, leafCert *x509.Certificate) bool {
+	if li.instanceOpts.NonFreshSubmissionLimiter != nil {
+		if li.TimeSource.Now().Add(-li.instanceOpts.FreshSubmissionMaxAge).After(leafCert.NotBefore) {
+			return !li.instanceOpts.NonFreshSubmissionLimiter.Allow()
+		}
 	}
-	return raw
-}
 
-// buildLogLeafForAddChain does the hashing to build a LogLeaf that will be
-// sent to the backend by add-chain and add-pre-chain endpoints.
-func buildLogLeafForAddChain(li *logInfo,
-	merkleLeaf ct.MerkleTreeLeaf, chain []*x509.Certificate, isPrecert bool,
-) (trillian.LogLeaf, error) {
-	raw := extractRawCerts(chain)
-	return util.BuildLogLeaf(li.LogPrefix, merkleLeaf, 0, raw[0], raw[1:], isPrecert)
+	return false
 }
 
 // marshalAndWriteAddChainResponse is used by add-chain and add-pre-chain to create and write
@@ -1101,13 +1154,15 @@ func (li *logInfo) toHTTPStatus(err error) int {
 	case codes.OK:
 		return http.StatusOK
 	case codes.Canceled, codes.DeadlineExceeded:
-		return http.StatusRequestTimeout
+		return http.StatusGatewayTimeout
 	case codes.InvalidArgument, codes.OutOfRange, codes.AlreadyExists:
 		return http.StatusBadRequest
 	case codes.NotFound:
 		return http.StatusNotFound
-	case codes.PermissionDenied, codes.ResourceExhausted:
+	case codes.PermissionDenied:
 		return http.StatusForbidden
+	case codes.ResourceExhausted:
+		return http.StatusTooManyRequests
 	case codes.Unauthenticated:
 		return http.StatusUnauthorized
 	case codes.FailedPrecondition:
@@ -1120,5 +1175,14 @@ func (li *logInfo) toHTTPStatus(err error) int {
 		return http.StatusServiceUnavailable
 	default:
 		return http.StatusInternalServerError
+	}
+}
+
+// recordStartPercent works out what percentage of the current log size an index corresponds to,
+// and records this to the getEntriesStartPercentiles histogram.
+func recordStartPercent(leafIndex int64, treeSize uint64, labelVals ...string) {
+	if treeSize > 0 {
+		percent := float64(leafIndex) / float64(treeSize) * 100.0
+		getEntriesStartPercentiles.Observe(percent, labelVals...)
 	}
 }

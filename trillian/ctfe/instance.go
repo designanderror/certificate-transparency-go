@@ -29,12 +29,15 @@ import (
 
 	"github.com/google/certificate-transparency-go/asn1"
 	"github.com/google/certificate-transparency-go/schedule"
+	"github.com/google/certificate-transparency-go/trillian/ctfe/cache"
+	"github.com/google/certificate-transparency-go/trillian/ctfe/storage"
 	"github.com/google/certificate-transparency-go/trillian/util"
 	"github.com/google/certificate-transparency-go/x509"
 	"github.com/google/certificate-transparency-go/x509util"
 	"github.com/google/trillian"
 	"github.com/google/trillian/crypto/keys"
 	"github.com/google/trillian/monitoring"
+	"golang.org/x/time/rate"
 	"k8s.io/klog/v2"
 )
 
@@ -65,6 +68,15 @@ type InstanceOptions struct {
 	// limited. If unset, no quota will be requested for intermediate
 	// certificates.
 	CertificateQuotaUser func(*x509.Certificate) string
+	// FreshSubmissionMaxAge is the maximum age of a fresh submission.
+	// Freshness is determined by comparing the NotBefore timestamp of
+	// the first certificate in the submitted chain against the current time.
+	FreshSubmissionMaxAge time.Duration
+	// NonFreshSubmissionLimiter limits the rate at which this log instance
+	// will accept non-fresh submissions.
+	// This is used to prevent the log from being flooded with requests for
+	// "old" certificates.
+	NonFreshSubmissionLimiter *rate.Limiter
 	// STHStorage provides STHs of a source log for the mirror. Only mirror
 	// instances will use it, i.e. when IsMirror == true in the config. If it is
 	// empty then the DefaultMirrorSTHStorage will be used.
@@ -72,6 +84,10 @@ type InstanceOptions struct {
 	// MaskInternalErrors indicates if internal server errors should be masked
 	// or returned to the user containing the full error message.
 	MaskInternalErrors bool
+	// CacheType is the CTFE cache type.
+	CacheType cache.Type
+	// CacheOption includes the cache size and time-to-live (TTL).
+	CacheOption cache.Option
 }
 
 // Instance is a set up log/mirror instance. It must be created with the
@@ -174,7 +190,24 @@ func setUpLogInfo(ctx context.Context, opts InstanceOptions) (*logInfo, error) {
 		return nil, fmt.Errorf("failed to parse RejectExtensions: %v", err)
 	}
 
-	logInfo := newLogInfo(opts, validationOpts, signer, new(util.SystemTimeSource))
+	// Initialise IssuanceChainService with IssuanceChainStorage and IssuanceChainCache.
+	issuanceChainStorage, err := storage.NewIssuanceChainStorage(ctx, vCfg.ExtraDataIssuanceChainStorageBackend, vCfg.CTFEStorageConnectionString)
+	if err != nil {
+		return nil, err
+	}
+	if issuanceChainStorage == nil {
+		return newLogInfo(opts, validationOpts, signer, new(util.SystemTimeSource), &directIssuanceChainService{}), nil
+	}
+
+	// We are storing chains outside of Trillian, so set up cache and service.
+	issuanceChainCache, err := cache.NewIssuanceChainCache(ctx, opts.CacheType, opts.CacheOption)
+	if err != nil {
+		return nil, err
+	}
+
+	issuanceChainService := newIndirectIssuanceChainService(issuanceChainStorage, issuanceChainCache)
+
+	logInfo := newLogInfo(opts, validationOpts, signer, new(util.SystemTimeSource), issuanceChainService)
 	return logInfo, nil
 }
 
